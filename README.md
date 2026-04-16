@@ -1,5 +1,5 @@
 # 🚀 Digital Lending Growth & Portfolio Quality
-### *Production-Grade SQL Cohort Analytics — Pallav Technologies*
+### *Production-Grade SQL Cohort Analytics*
 
 [![Python](https://img.shields.io/badge/Python-3.10-blue?logo=python)](https://python.org)
 [![SQL](https://img.shields.io/badge/SQL-SQLite%2FPostgreSQL--Compatible-orange?logo=sqlite)](https://sqlite.org)
