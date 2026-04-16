@@ -1,15 +1,13 @@
 """
 =============================================================================
-PROJECT 3: Digital Lending Growth & LTV Analytics
+PROJECT 3: Digital Lending Growth & Portfolio Quality (Real-World Case)
 SQL Analytics Engine — Production-Grade Edition
 =============================================================================
-Demonstrates deep SQL mastery for a Data Analyst role at Pallav Technologies:
-  - Production DDL: Funnel events, disbursements, repayments
-  - Funnel Conversion using CTEs and step-by-step DROP calculation
-  - Cohort Repayment with LAG for month-on-month change
-  - Customer LTV Estimation using SUM() OVER (cumulative disbursement)
-  - Acquisition Efficiency: CAC scoring via NTILE
-  - Retention Rates: LEAD to predict next-month repayment risk
+Dataset: LendingClub (Real P2P Loan Performance Data)
+Demonstrates:
+  - Monthly Cohort growth in loan volume
+  - Portfolio Quality Mix (Grade distribution over time)
+  - Interest Margin trends vs Portfolio Aging
 =============================================================================
 """
 
@@ -21,317 +19,180 @@ import matplotlib.gridspec as gridspec
 import seaborn as sns
 from pathlib import Path
 
-BASE = Path("/scratch/nishanth.r/pallavi/project_3_growth_analytics")
+BASE = Path(".")
+DATA_DIR = Path(".")
 DB   = BASE / "growth_analytics.db"
 
+# ---------------------------------------------------------------------------
+# 1. SCHEMA DESIGN (Growth & Quality Schema)
+# ---------------------------------------------------------------------------
 DDL = """
-DROP TABLE IF EXISTS user_funnel;
-DROP VIEW IF EXISTS v_funnel_summary;
+DROP TABLE IF EXISTS portfolio_growth;
 
--- Core event table (each row = one user's journey state)
-CREATE TABLE user_funnel (
-    user_id           INTEGER PRIMARY KEY,
-    signup_month      TEXT    NOT NULL,
-    has_kyc           INTEGER NOT NULL CHECK (has_kyc IN (0, 1)),
-    has_application   INTEGER NOT NULL CHECK (has_application IN (0, 1)),
-    has_approval      INTEGER NOT NULL CHECK (has_approval IN (0, 1)),
-    has_disbursement  INTEGER NOT NULL CHECK (has_disbursement IN (0, 1)),
-    loan_amount       REAL    NOT NULL DEFAULT 0.0,
-    has_repayment     INTEGER NOT NULL CHECK (has_repayment IN (0, 1)),
-    ingested_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE portfolio_growth (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    loan_amount          REAL NOT NULL,
+    grade                TEXT,
+    interest_rate        REAL,
+    issue_month          TEXT,
+    loan_status          TEXT,
+    paid_total           REAL,
+    ingested_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Indexes optimized for cohort and funnel queries
-CREATE INDEX idx_signup_month ON user_funnel(signup_month);
-CREATE INDEX idx_disbursement ON user_funnel(has_disbursement, signup_month);
-CREATE INDEX idx_repayment    ON user_funnel(has_repayment, signup_month);
-
--- Pre-built VIEW for funnel reporting (production pattern)
-CREATE VIEW v_funnel_summary AS
-SELECT
-    signup_month,
-    COUNT(*)                AS registered,
-    SUM(has_kyc)            AS kyc_completed,
-    SUM(has_application)    AS apps_submitted,
-    SUM(has_approval)       AS approved,
-    SUM(has_disbursement)   AS disbursed,
-    SUM(has_repayment)      AS repaid
-FROM user_funnel
-GROUP BY signup_month;
+CREATE INDEX idx_issue_month ON portfolio_growth(issue_month);
+CREATE INDEX idx_grade        ON portfolio_growth(grade);
 """
+
+# ---------------------------------------------------------------------------
+# 2. ANALYTICAL SQL QUERIES (Production-Grade Growth Analytics)
+# ---------------------------------------------------------------------------
 
 QUERIES = {
 
-    # Query 1: Full Funnel Conversion with Step-Level Drop-Off (CTE Chain)
-    # Business Question: Where are we losing customers — before KYC, or at approval?
-    "funnel_conversion_analysis": """
-        WITH base AS (
+    # Query 1: Monthly Cohort Volume Growth
+    "monthly_volume_growth": """
+        SELECT
+            issue_month,
+            COUNT(*)                        AS loan_count,
+            ROUND(SUM(loan_amount), 0)      AS total_disbursed,
+            ROUND(AVG(loan_amount), 0)      AS avg_ticket_size,
+            ROUND(AVG(interest_rate), 2)    AS avg_int_rate
+        FROM portfolio_growth
+        GROUP BY issue_month
+        ORDER BY issue_month;
+    """,
+
+    # Query 2: Portfolio Quality Mix by Cohort
+    "quality_mix_by_month": """
+        WITH grade_counts AS (
             SELECT
-                COUNT(*)              AS total_registered,
-                SUM(has_kyc)          AS kyc,
-                SUM(has_application)  AS applied,
-                SUM(has_approval)     AS approved,
-                SUM(has_disbursement) AS disbursed,
-                SUM(has_repayment)    AS repaid
-            FROM user_funnel
-        ),
-        stages AS (
-            SELECT 'Registration'   AS stage, 1 AS seq, total_registered  AS users FROM base
-            UNION ALL
-            SELECT 'KYC Complete',  2, kyc      FROM base
-            UNION ALL
-            SELECT 'Application',   3, applied  FROM base
-            UNION ALL
-            SELECT 'Approval',      4, approved FROM base
-            UNION ALL
-            SELECT 'Disbursement',  5, disbursed FROM base
-            UNION ALL
-            SELECT 'Repayment',     6, repaid   FROM base
+                issue_month,
+                grade,
+                COUNT(*) AS count
+            FROM portfolio_growth
+            GROUP BY issue_month, grade
         )
         SELECT
-            seq,
-            stage,
-            users,
-            -- Conversion from prior stage
-            ROUND(users * 100.0 / LAG(users) OVER (ORDER BY seq), 2) AS step_conversion_pct,
-            -- Overall conversion from registration
-            ROUND(users * 100.0 / FIRST_VALUE(users) OVER (ORDER BY seq
-                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), 2) AS overall_conversion_pct,
-            -- Drop-off count from prior stage
-            LAG(users) OVER (ORDER BY seq) - users AS users_dropped
-        FROM stages
-        ORDER BY seq;
+            issue_month,
+            grade,
+            count,
+            ROUND(count * 100.0 / SUM(count) OVER (PARTITION BY issue_month), 2) AS mix_pct
+        FROM grade_counts
+        ORDER BY issue_month, grade;
     """,
 
-    # Query 2: Cohort Repayment Trend with Month-on-Month Change (LAG)
-    # Business Question: Are newer cohorts riskier? Is the underwriting model drifting?
-    "cohort_repayment_trend": """
-        WITH cohort_metrics AS (
-            SELECT
-                signup_month,
-                COUNT(*)                                         AS users_disbursed,
-                SUM(has_repayment)                               AS repaid,
-                ROUND(AVG(has_repayment) * 100, 2)              AS repayment_rate_pct,
-                ROUND(SUM(loan_amount), 0)                       AS total_disbursed_amount,
-                ROUND(SUM(CASE WHEN has_repayment=1 THEN loan_amount ELSE 0 END), 0) AS recovered_amount
-            FROM user_funnel
-            WHERE has_disbursement = 1
-            GROUP BY signup_month
-        )
+    # Query 3: Cohort Profitability & Loss (LTV Proxy)
+    "cohort_profitability": """
         SELECT
-            signup_month,
-            users_disbursed,
-            repayment_rate_pct,
-            total_disbursed_amount,
-            recovered_amount,
-            -- Month-on-Month change in repayment rate
-            ROUND(repayment_rate_pct - LAG(repayment_rate_pct) OVER (ORDER BY signup_month), 2) AS mom_change_pct,
-            -- 3-month moving average repayment rate
-            ROUND(AVG(repayment_rate_pct) OVER (
-                ORDER BY signup_month
-                ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-            ), 2) AS rolling_3m_repayment_rate,
-            CASE
-                WHEN repayment_rate_pct - LAG(repayment_rate_pct) OVER (ORDER BY signup_month) < -3
-                THEN '⚠️  DETERIORATING'
-                WHEN repayment_rate_pct - LAG(repayment_rate_pct) OVER (ORDER BY signup_month) > 3
-                THEN '✅  IMPROVING'
-                ELSE '➡️  STABLE'
-            END AS trend_flag
-        FROM cohort_metrics
-        ORDER BY signup_month;
+            issue_month,
+            ROUND(SUM(loan_amount), 0) AS disbursed,
+            ROUND(SUM(paid_total), 0)  AS recovered,
+            ROUND((SUM(paid_total) - SUM(loan_amount)), 0) AS net_recovery_margin,
+            ROUND(AVG(paid_total / loan_amount) * 100, 2) AS recovery_perf_pct
+        FROM portfolio_growth
+        GROUP BY issue_month
+        ORDER BY issue_month;
     """,
 
-    # Query 3: Customer Lifetime Value (LTV) Estimation using Window SUM
-    # Business Question: What is the cumulative value generated by each acquisition cohort?
-    "cohort_ltv_analysis": """
-        WITH cohort_value AS (
-            SELECT
-                signup_month,
-                COUNT(*)                                              AS total_users,
-                SUM(has_disbursement)                                 AS borrowers,
-                ROUND(SUM(loan_amount), 0)                            AS total_loan_amount,
-                ROUND(SUM(CASE WHEN has_repayment = 1 THEN loan_amount ELSE 0 END), 0) AS revenue_recovered,
-                -- Estimated LTV = recovered amount × assumed margin (5% net interest margin)
-                ROUND(SUM(CASE WHEN has_repayment = 1 THEN loan_amount ELSE 0 END) * 0.05, 0) AS estimated_ltv
-            FROM user_funnel
-            GROUP BY signup_month
-        )
-        SELECT
-            signup_month,
-            total_users,
-            borrowers,
-            total_loan_amount,
-            revenue_recovered,
-            estimated_ltv,
-            -- Cumulative LTV across cohorts (running business value metric)
-            SUM(estimated_ltv) OVER (
-                ORDER BY signup_month
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            )                                                          AS cumulative_ltv,
-            -- LTV per acquired user (CAC efficiency proxy)
-            ROUND(estimated_ltv * 1.0 / NULLIF(total_users, 0), 2)   AS ltv_per_user
-        FROM cohort_value
-        ORDER BY signup_month;
-    """,
-
-    # Query 4: Funnel Quality by Cohort — Monthly Cross-Tab
-    # Business Question: Are earlier cohorts better quality? (via view)
-    "monthly_funnel_quality": """
-        SELECT
-            signup_month,
-            registered,
-            kyc_completed,
-            apps_submitted,
-            disbursed,
-            repaid,
-            ROUND(kyc_completed    * 100.0 / NULLIF(registered, 0), 1)     AS kyc_rate,
-            ROUND(apps_submitted   * 100.0 / NULLIF(kyc_completed, 0), 1)  AS app_rate,
-            ROUND(disbursed        * 100.0 / NULLIF(apps_submitted, 0), 1) AS disburse_rate,
-            ROUND(repaid           * 100.0 / NULLIF(disbursed, 0), 1)      AS repayment_rate,
-            -- Full-funnel efficiency
-            ROUND(repaid * 100.0 / NULLIF(registered, 0), 2)               AS end_to_end_efficiency_pct,
-            -- Rank cohorts by end-to-end efficiency
-            RANK() OVER (ORDER BY ROUND(repaid * 100.0 / NULLIF(registered, 0), 2) DESC) AS efficiency_rank
-        FROM v_funnel_summary
-        ORDER BY signup_month;
-    """,
-
-    # Query 5: Growth KPIs Summary
+    # Query 4: Growth KPIs (Dashboard Header)
     "growth_kpis": """
         SELECT
-            COUNT(DISTINCT signup_month)                             AS cohorts_tracked,
-            COUNT(*)                                                 AS total_users,
-            SUM(has_disbursement)                                    AS total_borrowers,
-            ROUND(SUM(has_disbursement) * 100.0 / COUNT(*), 2)     AS overall_conversion_pct,
-            ROUND(SUM(loan_amount), 0)                               AS total_disbursed,
-            SUM(has_repayment)                                       AS total_repaid_loans,
-            ROUND(SUM(CASE WHEN has_repayment=1 THEN loan_amount ELSE 0 END), 0) AS recovered_amt,
-            ROUND(SUM(CASE WHEN has_repayment=1 THEN loan_amount ELSE 0 END)
-                  * 100.0 / NULLIF(SUM(loan_amount), 0), 2)        AS portfolio_repayment_rate_pct
-        FROM user_funnel;
+            COUNT(*)                                      AS total_loans,
+            ROUND(SUM(loan_amount), 0)                    AS lifetime_disbursed,
+            ROUND(AVG(interest_rate), 2)                  AS portfolio_yield_pct,
+            COUNT(DISTINCT issue_month)                   AS cohorts_tracked
+        FROM portfolio_growth;
     """
 }
 
-def build_database():
-    df = pd.read_csv(BASE / "funnel_data.csv")
+# ---------------------------------------------------------------------------
+# 3. EXECUTION ENGINE
+# ---------------------------------------------------------------------------
+
+def load_data():
+    csv_path = DATA_DIR / "lending_club_openintro.csv"
+    if not csv_path.exists():
+        print(f"❌ Data file not found: {csv_path}")
+        return
+
+    df = pd.read_csv(csv_path)
+
+    # Column Selection
+    cols = {
+        'loan_amount': 'loan_amount', 'grade': 'grade', 'interest_rate': 'interest_rate',
+        'issue_month': 'issue_month', 'loan_status': 'loan_status', 'paid_total': 'paid_total'
+    }
+    df_clean = df[list(cols.keys())].rename(columns=cols)
+
     con = sqlite3.connect(DB)
     con.executescript(DDL)
-    df.to_sql("user_funnel", con, if_exists="append", index=False)
+    df_clean.to_sql("portfolio_growth", con, if_exists="append", index=False)
     con.commit()
-    print(f"✅ Growth Analytics DB created — {len(df)} user records loaded.")
+    print(f"✅ Growth & Quality data loaded: {len(df_clean)} records.")
     return con
 
 def run_analytics(con):
     results = {}
     for name, sql in QUERIES.items():
-        df = pd.read_sql_query(sql, con)
-        results[name] = df
-        print(f"\n{'='*65}")
-        print(f"📊 {name.upper().replace('_', ' ')}")
-        print('='*65)
-        print(df.to_string(index=False))
+        try:
+            df = pd.read_sql_query(sql, con)
+            results[name] = df
+            print(f"\n📊 {name.upper().replace('_', ' ')}")
+            print(df.head(10).to_string(index=False))
+        except Exception as e:
+            print(f"❌ Error in {name}: {e}")
     return results
 
-def plot_results(results):
-    sns.set_theme(style="dark")
-    fig = plt.figure(figsize=(20, 14), facecolor="#0d1117")
-    fig.suptitle(
-        "Pallav Credit OS — Digital Lending Growth & LTV Dashboard",
-        fontsize=18, color="white", fontweight="bold", y=0.98
-    )
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.5, wspace=0.4)
-    text_kw = dict(color="white")
+def plot_visuals(results):
+    sns.set_theme(style="whitegrid", palette="muted")
+    fig = plt.figure(figsize=(20, 12), facecolor="#ffffff")
+    fig.suptitle("Pallav Technologies — Lending Growth & Portfolio Quality Dashboard",
+                 fontsize=22, fontweight="bold", y=0.98)
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.25)
 
-    # Plot 1: Funnel Waterfall Chart
-    ax1 = fig.add_subplot(gs[0, 0:2])
-    d = results["funnel_conversion_analysis"].dropna(subset=["overall_conversion_pct"])
-    cmap = plt.cm.Blues(np.linspace(0.4, 1.0, len(d)))
-    bars = ax1.bar(d["stage"], d["users"], color=cmap, width=0.55)
-    ax1.set_facecolor("#161b22")
-    ax1.set_title("Customer Acquisition Funnel (SQL CTE Chain)", color="white", fontsize=12, pad=10)
-    ax1.set_ylabel("Users", **text_kw)
-    ax1.tick_params(colors="white", axis="x", rotation=15)
-    ax1.tick_params(colors="white", axis="y")
-    ax1.spines[:].set_color("#30363d")
-    for bar, row in zip(bars, d.itertuples()):
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
-                 f"{row.users:,}\n({row.overall_conversion_pct}%)",
-                 ha="center", color="white", fontsize=8.5)
+    # Plot 1: Monthly Volume Growth
+    ax1 = fig.add_subplot(gs[0, 0])
+    d1 = results["monthly_volume_growth"]
+    sns.lineplot(x="issue_month", y="total_disbursed", data=d1, ax=ax1, marker="o", color="#0d6efd", linewidth=3)
+    ax1.set_title("Monthly Disbursement Volume Growth (₹)", fontsize=15)
+    ax1.set_ylabel("Total Disbursed (₹)")
+    plt.setp(ax1.get_xticklabels(), rotation=45)
 
-    # Plot 2: Cohort Repayment Rate Trend + 3M Rolling Average
-    ax2 = fig.add_subplot(gs[0, 2])
-    d2 = results["cohort_repayment_trend"]
-    ax2.bar(d2["signup_month"], d2["repayment_rate_pct"], alpha=0.5,
-            color="#818cf8", label="Monthly Rate")
-    ax2.plot(d2["signup_month"], d2["rolling_3m_repayment_rate"],
-             color="#f97316", linewidth=2.5, marker="o", markersize=6, label="3M Rolling Avg")
-    ax2.set_facecolor("#161b22")
-    ax2.set_title("Cohort Repayment Quality\n(LAG + Rolling Window)", color="white", fontsize=11, pad=10)
-    ax2.set_ylabel("Repayment Rate (%)", **text_kw)
-    ax2.tick_params(colors="white", axis="x", rotation=25)
-    ax2.tick_params(colors="white", axis="y")
-    ax2.spines[:].set_color("#30363d")
-    ax2.legend(facecolor="#161b22", labelcolor="white", fontsize=8)
-    ax2.set_ylim(50, 100)
+    # Plot 2: Yield Trend
+    ax2 = fig.add_subplot(gs[0, 1])
+    sns.barplot(x="issue_month", y="avg_int_rate", data=d1, ax=ax2, palette="Greens")
+    ax2.set_title("Average Portfolio Yield Trend (% Interest Rate)", fontsize=15)
+    ax2.set_ylabel("Avg Int Rate (%)")
+    plt.setp(ax2.get_xticklabels(), rotation=45)
 
-    # Plot 3: Cumulative LTV by Cohort (Running SUM OVER)
+    # Plot 3: Quality Mix Heatmap
     ax3 = fig.add_subplot(gs[1, 0])
-    d3 = results["cohort_ltv_analysis"]
-    ax3.fill_between(d3["signup_month"], d3["cumulative_ltv"], alpha=0.4, color="#a78bfa")
-    ax3.plot(d3["signup_month"], d3["cumulative_ltv"], color="#7c3aed",
-             linewidth=2.5, marker="s", markersize=7)
-    ax3.set_facecolor("#161b22")
-    ax3.set_title("Cumulative LTV Across Cohorts\n(SUM OVER Window)", color="white", fontsize=11, pad=10)
-    ax3.set_ylabel("Cumulative LTV (₹)", **text_kw)
-    ax3.tick_params(colors="white", axis="x", rotation=25)
-    ax3.tick_params(colors="white", axis="y")
-    ax3.spines[:].set_color("#30363d")
-    for i, row in d3.iterrows():
-        ax3.text(i, row["cumulative_ltv"] + 100, f"₹{row['cumulative_ltv']:,.0f}",
-                 ha="center", color="#c4b5fd", fontsize=7.5)
+    d2_pivot = results["quality_mix_by_month"].pivot(index="grade", columns="issue_month", values="mix_pct").fillna(0)
+    sns.heatmap(d2_pivot, annot=True, cmap="YlGnBu", ax=ax3, fmt=".1f")
+    ax3.set_title("Cohort Quality Mix (%) - Loan Grades over Time", fontsize=15)
 
-    # Plot 4: Monthly Funnel Quality Heatmap
+    # Plot 4: KPI Text Box
     ax4 = fig.add_subplot(gs[1, 1])
-    d4 = results["monthly_funnel_quality"].set_index("signup_month")
-    rate_cols = ["kyc_rate", "app_rate", "disburse_rate", "repayment_rate"]
-    sns.heatmap(d4[rate_cols], annot=True, fmt=".1f", cmap="RdYlGn", ax=ax4,
-                vmin=0, vmax=100, linewidths=0.5, linecolor="#30363d",
-                cbar_kws={"label": "Rate (%)"})
-    ax4.set_title("Monthly Funnel Quality Heatmap\n(RANK by Efficiency)", color="white", fontsize=11, pad=10)
-    ax4.set_ylabel("Signup Month", **text_kw)
-    ax4.set_xlabel("Funnel Stage Rate", **text_kw)
-    ax4.tick_params(colors="white", labelsize=8)
-    ax4.set_facecolor("#161b22")
-
-    # Plot 5: KPI Card
-    ax5 = fig.add_subplot(gs[1, 2])
-    ax5.axis("off")
+    ax4.axis("off")
     kpi = results["growth_kpis"].iloc[0]
-    text = (
-        "  GROWTH KPIs\n"
-        f"  {'─'*30}\n"
-        f"  Cohorts Tracked     : {int(kpi['cohorts_tracked'])}\n"
-        f"  Total Users         : {int(kpi['total_users']):,}\n"
-        f"  Total Borrowers     : {int(kpi['total_borrowers']):,}\n"
-        f"  End-to-End Conv.    : {kpi['overall_conversion_pct']}%\n"
-        f"  Total Disbursed     : ₹{int(kpi['total_disbursed']):,}\n"
-        f"  Total Recovered     : ₹{int(kpi['recovered_amt']):,}\n"
-        f"  Portfolio Repay Rate: {kpi['portfolio_repayment_rate_pct']}%"
+    summary_text = (
+        f"  Total Loans Disbursed    : {int(kpi['total_loans']):,}\n\n"
+        f"  Cumulative Volume        : ₹{int(kpi['lifetime_disbursed']):,}\n"
+        f"  Portfolio Average Yield  : {kpi['portfolio_yield_pct']}%\n"
+        f"  Active Cohorts Tracked   : {int(kpi['cohorts_tracked'])}\n"
     )
-    ax5.text(0.05, 0.95, text, transform=ax5.transAxes, fontsize=10.5,
-             verticalalignment="top", fontfamily="monospace",
-             color="#fde68a", bbox=dict(boxstyle="round,pad=0.8", facecolor="#1c1917", edgecolor="#d97706"))
-    ax5.set_title("Business Growth KPIs", color="white", fontsize=11)
+    ax4.text(0.1, 0.45, summary_text, fontsize=18, family="monospace",
+             bbox=dict(boxstyle="round", facecolor="#f8f9fa", alpha=0.9, edgecolor="#198754"))
+    ax4.set_title("Business Growth KPIs", fontsize=18, fontweight="bold")
 
-    out = BASE / "growth_sql_dashboard.png"
-    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    print(f"\n✅ Growth Dashboard saved → {out}")
-    plt.close()
+    out_path = BASE / "growth_sql_dashboard.png"
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")
+    print(f"✅ Growth Dashboard generated: {out_path}")
 
 if __name__ == "__main__":
-    con = build_database()
-    results = run_analytics(con)
-    plot_results(results)
-    con.close()
-    print("\n✅ Project 3 SQL Analytics complete.")
+    connection = load_data()
+    if connection:
+        analytical_results = run_analytics(connection)
+        plot_visuals(analytical_results)
+        connection.close()
