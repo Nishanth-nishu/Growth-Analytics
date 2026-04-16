@@ -40,4 +40,3 @@ Generated dashboards include:
 
 ---
 
-*Built for Pallav Technologies Portfolio — Advanced Growth Pillar.*
