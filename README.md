@@ -18,4 +18,3 @@ A comprehensive analysis of the digital lending acquisition funnel and customer 
 - `*.png`: Visualizations of the acquisition funnel and cohort repayment trends.
 
 ---
-*Created for Pallav Technologies Data Analyst Portfolio.*
